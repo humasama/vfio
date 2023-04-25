@@ -479,6 +479,8 @@ int main(int argc, char **argv)
 	printf("Using PCI device %04x:%02x:%02x.%d in group %d\n",
                seg, bus, dev, func, groupid);
 
+    //sleep(20);
+
 	container = open("/dev/vfio/vfio", O_RDWR);
 	if (container < 0) {
 		printf("Failed to open /dev/vfio/vfio, %d (%s)\n",
@@ -534,6 +536,7 @@ int main(int argc, char **argv)
 	}
 
 	ret = ioctl(container, VFIO_SET_IOMMU, VFIO_NOIOMMU_IOMMU);
+	printf("ioctl: VFIO_SET_IOMMU (NOIOMMU): %d\n", ret);
 	if (ret) {
 		printf("Failed to set IOMMU\n");
 		return ret;
@@ -543,7 +546,7 @@ int main(int argc, char **argv)
 
 	device = ioctl(group, VFIO_GROUP_GET_DEVICE_FD, path);
 	if (device < 0) {
-		printf("Failed to get device %s\n", path);
+		printf("Failed to get device %s (%d)\n", path, device);
 		return -1;
 	}
 
@@ -552,9 +555,10 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
-	printf("Device supports %d regions, %d irqs\n",
-	       device_info.num_regions, device_info.num_irqs);
+	printf("Device (%d) supports %d regions, %d irqs\n",
+            device, device_info.num_regions, device_info.num_irqs);
 
+#if 0
 	for (i = 0; i < device_info.num_regions; i++) {
 		printf("Region %d: ", i);
 		region_info.index = i;
@@ -582,6 +586,7 @@ int main(int argc, char **argv)
 			munmap(map, (size_t)region_info.size);
 		}
 	}
+#endif
 
 	printf("Success\n");
 	printf("Press any key to exit\n");
