@@ -13,6 +13,8 @@
 
 #include <linux/types.h>
 #include <linux/ioctl.h>
+#include <unistd.h>
+#include <stdint.h>
 
 #define VFIO_API_VERSION	0
 
@@ -433,6 +435,7 @@ struct vfio_iommu_type1_dma_unmap {
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/vfs.h>
+#include <stdbool.h>
 
 #include <linux/ioctl.h>
 
@@ -441,156 +444,232 @@ void usage(char *name)
 	printf("usage: %s <iommu group id> <ssss:bb:dd.f>\n", name);
 }
 
+#include "header.h"
+
+void read_pci_config(int device)
+{
+#define VFIO_GET_REGION_ADDR(x) ((uint64_t) x << 40ULL)
+#define PCI_CAPABILITY_LIST 0x34
+#define PCI_CAP_ID_VNDR     0x09 
+
+    uint8_t pos;
+    pread(device, &pos, sizeof(pos),
+            VFIO_GET_REGION_ADDR(VFIO_PCI_CONFIG_REGION_INDEX) +
+            PCI_CAPABILITY_LIST);
+    printf("Capability pointer (offset) is %d\n", pos);
+
+    while (pos) {
+        struct virtio_pci_cap cap;
+        pread(device, &cap, 2,
+                VFIO_GET_REGION_ADDR(VFIO_PCI_CONFIG_REGION_INDEX) +
+                pos);
+        if (cap.cap_vndr != PCI_CAP_ID_VNDR)
+            goto next;
+
+        pread(device, &cap, sizeof(cap),
+                VFIO_GET_REGION_ADDR(VFIO_PCI_CONFIG_REGION_INDEX) +
+                pos);
+        switch (cap.cfg_type) {
+            case VIRTIO_PCI_CAP_COMMON_CFG:
+                printf("common cfg: offset: %d, bar: %d, len: %d\n",
+                        cap.offset, cap.bar, cap.length);
+                uint64_t bar_offset = cap.offset + (VFIO_GET_REGION_ADDR(cap.bar));
+
+                bool print_common_cfg = true;
+                if (print_common_cfg) {
+                    int i;
+                    printf("pread: ");
+                    for (i = 0; i < 16; i += 4) {
+                        uint32_t value;
+                        pread(device, &value, 4, VFIO_GET_REGION_ADDR(4) + i);
+                        printf("%d, ", value);
+                    }
+                    uint16_t value = 0;
+                    pread(device, &value, 2, VFIO_GET_REGION_ADDR(4) + i);
+                    printf("%d, ", value);
+                    i += 2;
+
+                    value = 0;
+                    pread(device, &value, 2, VFIO_GET_REGION_ADDR(4) + i);
+                    printf("%d, ", value);
+                    i += 2;
+
+                    value = 0;
+                    pread(device, &value, 1, VFIO_GET_REGION_ADDR(4) + i);
+                    printf("%d, ", value);
+                    i += 1;
+
+                    value = 0;
+                    pread(device, &value, 1, VFIO_GET_REGION_ADDR(4) + i);
+                    printf("%d\n", value);
+                    printf("end\n\n\n");
+                }
+
+                uint8_t status_offset = 20;
+                uint8_t status;
+                pread(device, &status, 1, bar_offset + status_offset);
+                printf("VirtIO status (INIT): %d\n", status);
+
+                uint8_t value = VIRTIO_CONFIG_STATUS_RESET;
+                pwrite(device, &value, 1, bar_offset + status_offset);
+
+                pread(device, &status, 1, bar_offset + status_offset);
+                printf("VirtIO status (RESET): %d\n", status);
+                break;
+        }
+next:
+        pos = cap.cap_next;
+    }
+}
+
+void read_region_info(int device,
+        struct vfio_region_info *region_info,
+        struct vfio_device_info device_info)
+{
+    int i;
+    for (i = 0; i < device_info.num_regions; i++) {
+        if (i == 6) {
+            printf("Skip ROM region\n");
+            continue;
+        }
+        printf("Region %d: ", i);
+        region_info[i].index = i;
+        if (ioctl(device, VFIO_DEVICE_GET_REGION_INFO, &region_info[i])) {
+            printf("Failed to get info\n");
+            continue;
+        }
+
+        printf("size 0x%lx, offset 0x%lx, flags 0x%x\n",
+                (unsigned long)region_info[i].size,
+                (unsigned long)region_info[i].offset, region_info[i].flags);
+    }
+}
+
 int main(int argc, char **argv)
 {
-	int i, ret, container, group, device, groupid;
-	char path[PATH_MAX];
-	int seg, bus, dev, func;
+    int i, ret, container, group, device, groupid;
+    char path[PATH_MAX];
+    int seg, bus, dev, func;
 
-	struct vfio_group_status group_status = {
-		.argsz = sizeof(group_status)
-	};
+    struct vfio_group_status group_status = {
+        .argsz = sizeof(group_status)
+    };
 
-	struct vfio_device_info device_info = {
-		.argsz = sizeof(device_info)
-	};
+    struct vfio_device_info device_info = {
+        .argsz = sizeof(device_info)
+    };
 
-	struct vfio_region_info region_info = {
-		.argsz = sizeof(region_info)
-	};
+    struct vfio_region_info region_info[9];
+    for (i = 0; i < 6; i ++) {
+        region_info[i].argsz = sizeof(region_info);
+    }
 
-	if (argc < 3) {
-		usage(argv[0]);
-		return -1;
-	}
+    if (argc < 3) {
+        usage(argv[0]);
+        return -1;
+    }
 
-	ret = sscanf(argv[1], "%d", &groupid);
-	if (ret != 1) {
-		usage(argv[0]);
-		return -1;
-	}
+    ret = sscanf(argv[1], "%d", &groupid);
+    if (ret != 1) {
+        usage(argv[0]);
+        return -1;
+    }
 
-	ret = sscanf(argv[2], "%04x:%02x:%02x.%d", &seg, &bus, &dev, &func);
-	if (ret != 4) {
-		usage(argv[0]);
-		return -1;
-	}
+    ret = sscanf(argv[2], "%04x:%02x:%02x.%d", &seg, &bus, &dev, &func);
+    if (ret != 4) {
+        usage(argv[0]);
+        return -1;
+    }
 
-	printf("Using PCI device %04x:%02x:%02x.%d in group %d\n",
-               seg, bus, dev, func, groupid);
+    printf("Using PCI device %04x:%02x:%02x.%d in group %d\n",
+            seg, bus, dev, func, groupid);
 
     //sleep(20);
 
-	container = open("/dev/vfio/vfio", O_RDWR);
-	if (container < 0) {
-		printf("Failed to open /dev/vfio/vfio, %d (%s)\n",
-		       container, strerror(errno));
-		return container;
-	}
+    container = open("/dev/vfio/vfio", O_RDWR);
+    if (container < 0) {
+        printf("Failed to open /dev/vfio/vfio, %d (%s)\n",
+                container, strerror(errno));
+        return container;
+    }
 
-	snprintf(path, sizeof(path), "/dev/vfio/noiommu-%d", groupid);
-	group = open(path, O_RDWR);
-	if (group < 0) {
-		printf("Failed to open %s, %d (%s)\n",
-		       path, group, strerror(errno));
-		return group;
-	}
+    snprintf(path, sizeof(path), "/dev/vfio/noiommu-%d", groupid);
+    group = open(path, O_RDWR);
+    if (group < 0) {
+        printf("Failed to open %s, %d (%s)\n",
+                path, group, strerror(errno));
+        return group;
+    }
 
-	ret = ioctl(group, VFIO_GROUP_GET_STATUS, &group_status);
-	if (ret) {
-		printf("ioctl(VFIO_GROUP_GET_STATUS) failed\n");
-		return ret;
-	}
+    ret = ioctl(group, VFIO_GROUP_GET_STATUS, &group_status);
+    if (ret) {
+        printf("ioctl(VFIO_GROUP_GET_STATUS) failed\n");
+        return ret;
+    }
 
-	if (!(group_status.flags & VFIO_GROUP_FLAGS_VIABLE)) {
-		printf("Group not viable, are all devices attached to vfio?\n");
-		return -1;
-	}
+    if (!(group_status.flags & VFIO_GROUP_FLAGS_VIABLE)) {
+        printf("Group not viable, are all devices attached to vfio?\n");
+        return -1;
+    }
 
-	printf("pre-SET_CONTAINER:\n");
-	printf("VFIO_CHECK_EXTENSION VFIO_TYPE1_IOMMU: %sPresent\n",
-	       ioctl(container, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU) ?
-	       "" : "Not ");
-	printf("VFIO_CHECK_EXTENSION VFIO_NOIOMMU_IOMMU: %sPresent\n",
-	       ioctl(container, VFIO_CHECK_EXTENSION, VFIO_NOIOMMU_IOMMU) ?
-	       "" : "Not ");
-	
-	ret = ioctl(group, VFIO_GROUP_SET_CONTAINER, &container);
-	if (ret) {
-		printf("Failed to set group container\n");
-		return ret;
-	}
+    printf("pre-SET_CONTAINER:\n");
+    printf("VFIO_CHECK_EXTENSION VFIO_TYPE1_IOMMU: %sPresent\n",
+            ioctl(container, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU) ?
+            "" : "Not ");
+    printf("VFIO_CHECK_EXTENSION VFIO_NOIOMMU_IOMMU: %sPresent\n",
+            ioctl(container, VFIO_CHECK_EXTENSION, VFIO_NOIOMMU_IOMMU) ?
+            "" : "Not ");
 
-	printf("post-SET_CONTAINER:\n");
-	printf("VFIO_CHECK_EXTENSION VFIO_TYPE1_IOMMU: %sPresent\n",
-	       ioctl(container, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU) ?
-	       "" : "Not ");
-	printf("VFIO_CHECK_EXTENSION VFIO_NOIOMMU_IOMMU: %sPresent\n",
-	       ioctl(container, VFIO_CHECK_EXTENSION, VFIO_NOIOMMU_IOMMU) ?
-	       "" : "Not ");
-	
-	ret = ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU);
-	if (!ret) {
-		printf("ERROR, was able to use type1 IOMMU with no-iommu\n");
-		return -1;
-	}
+    ret = ioctl(group, VFIO_GROUP_SET_CONTAINER, &container);
+    if (ret) {
+        printf("Failed to set group container\n");
+        return ret;
+    }
 
-	ret = ioctl(container, VFIO_SET_IOMMU, VFIO_NOIOMMU_IOMMU);
-	printf("ioctl: VFIO_SET_IOMMU (NOIOMMU): %d\n", ret);
-	if (ret) {
-		printf("Failed to set IOMMU\n");
-		return ret;
-	}
+    printf("post-SET_CONTAINER:\n");
+    printf("VFIO_CHECK_EXTENSION VFIO_TYPE1_IOMMU: %sPresent\n",
+            ioctl(container, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU) ?
+            "" : "Not ");
+    printf("VFIO_CHECK_EXTENSION VFIO_NOIOMMU_IOMMU: %sPresent\n",
+            ioctl(container, VFIO_CHECK_EXTENSION, VFIO_NOIOMMU_IOMMU) ?
+            "" : "Not ");
 
-	snprintf(path, sizeof(path), "%04x:%02x:%02x.%d", seg, bus, dev, func);
+    ret = ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU);
+    if (!ret) {
+        printf("ERROR, was able to use type1 IOMMU with no-iommu\n");
+        return -1;
+    }
 
-	device = ioctl(group, VFIO_GROUP_GET_DEVICE_FD, path);
-	if (device < 0) {
-		printf("Failed to get device %s (%d)\n", path, device);
-		return -1;
-	}
+    ret = ioctl(container, VFIO_SET_IOMMU, VFIO_NOIOMMU_IOMMU);
+    printf("ioctl: VFIO_SET_IOMMU (NOIOMMU): %d\n", ret);
+    if (ret) {
+        printf("Failed to set IOMMU\n");
+        return ret;
+    }
 
-	if (ioctl(device, VFIO_DEVICE_GET_INFO, &device_info)) {
-		printf("Failed to get device info\n");
-		return -1;
-	}
+    snprintf(path, sizeof(path), "%04x:%02x:%02x.%d", seg, bus, dev, func);
 
-	printf("Device (%d) supports %d regions, %d irqs\n",
+    device = ioctl(group, VFIO_GROUP_GET_DEVICE_FD, path);
+    if (device < 0) {
+        printf("Failed to get device %s (%d)\n", path, device);
+        return -1;
+    }
+
+    if (ioctl(device, VFIO_DEVICE_GET_INFO, &device_info)) {
+        printf("Failed to get device info\n");
+        return -1;
+    }
+
+    printf("Device (%d) supports %d regions, %d irqs\n",
             device, device_info.num_regions, device_info.num_irqs);
 
-#if 0
-	for (i = 0; i < device_info.num_regions; i++) {
-		printf("Region %d: ", i);
-		region_info.index = i;
-		if (ioctl(device, VFIO_DEVICE_GET_REGION_INFO, &region_info)) {
-			printf("Failed to get info\n");
-			continue;
-		}
+    read_region_info(device, region_info, device_info);
+    read_pci_config(device);
 
-		printf("size 0x%lx, offset 0x%lx, flags 0x%x\n",
-		       (unsigned long)region_info.size,
-		       (unsigned long)region_info.offset, region_info.flags);
-		if (0 && region_info.flags & VFIO_REGION_INFO_FLAG_MMAP) {
-			void *map = mmap(NULL, (size_t)region_info.size,
-					 PROT_READ, MAP_SHARED, device,
-					 (off_t)region_info.offset);
-			if (map == MAP_FAILED) {
-				printf("mmap failed\n");
-				continue;
-			}
+    printf("Success\n");
+    printf("Press any key to exit\n");
+    fgetc(stdin);
 
-			printf("[");
-			fwrite(map, 1, region_info.size > 16 ? 16 :
-						region_info.size, stdout);
-			printf("]\n");
-			munmap(map, (size_t)region_info.size);
-		}
-	}
-#endif
-
-	printf("Success\n");
-	printf("Press any key to exit\n");
-	fgetc(stdin);
-
-	return 0;
+    return 0;
 }
+
